@@ -70,6 +70,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = rf.role == Leader
 	return term, isleader
 }
 
@@ -111,6 +113,11 @@ func (rf *Raft) startElection() {
 				if reply.Term <= rf.currentTerm &&
 					reply.VoteGranted {
 					count += 1
+				} else {
+					rf.currentTerm = reply.Term
+					rf.role = Follower
+					rf.votedFor = -1
+					return
 				}
 			}
 		}

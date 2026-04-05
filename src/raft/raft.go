@@ -77,12 +77,47 @@ func (rf *Raft) GetState() (int, bool) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+func (rf *Raft) startElection() {
+	rf.currentTerm += 1
+	args := RequestVoteArgs{
+		rf.currentTerm,
+		rf.me,
+	}
+
+	majority := len(rf.peers)/2 + 1
+
+	if rf.role == Candidate {
+		count := 1
+		rf.votedFor = rf.me
+		for i := 0; i < len(rf.peers); i++ {
+			var reply RequestVoteReply
+			if i != rf.me {
+				ok := rf.sendRequestVote(i, &args, &reply)
+				if !ok {
+					continue
+				}
+				if reply.Term <= rf.currentTerm &&
+					reply.VoteGranted {
+					count += 1
+				}
+			}
+		}
+		if count >= majority {
+			rf.role = Leader
+		}
+	}
 }
 
 // example RequestVote RPC handler.
@@ -90,6 +125,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// Read the fields in "args",
 	// and accordingly assign the values for fields in "reply".
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -192,6 +228,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
 			if time.Since(rf.lastHeartBeat) > timeout {
 				rf.role = Candidate
+				rf.startElection()
 			}
 			time.Sleep(timeout)
 		}

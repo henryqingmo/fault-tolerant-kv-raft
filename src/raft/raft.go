@@ -121,30 +121,37 @@ func (rf *Raft) startElection() {
 	if role == Candidate {
 		count := 1
 		for i := 0; i < len(rf.peers); i++ {
-			var reply RequestVoteReply
-			if i != me {
-				ok := rf.sendRequestVote(i, &args, &reply)
+			if i == me {
+				continue
+			}
+
+			go func(peerID int) {
+				var reply RequestVoteReply
+				ok := rf.sendRequestVote(peerID, &args, &reply)
+
 				if !ok {
-					continue
+					return
 				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
 				// step down
 				if reply.Term > currentTerm {
-					rf.mu.Lock()
 					rf.currentTerm = reply.Term
 					rf.role = Follower
 					rf.votedFor = -1
-					rf.mu.Unlock()
 					return
 				}
 				if reply.VoteGranted {
 					count += 1
 				}
-			}
-		}
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if rf.role == Candidate && count >= majority {
-			rf.role = Leader
+
+				if rf.role == Candidate && count >= majority {
+					rf.role = Leader
+				}
+
+			}(i)
 		}
 	}
 }

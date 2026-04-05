@@ -93,6 +93,15 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+type AppendEntriesArgs struct {
+	Term int
+	//LeaderID	int
+}
+
+type AppendEntriesReply struct {
+	Term int
+}
+
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm += 1
@@ -209,6 +218,31 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// AppendEntries RPC Handler
+// TODO: Add impl for 2B
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// step down
+	if args.Term > rf.currentTerm {
+		rf.role = Follower
+		rf.currentTerm = args.Term
+	}
+
+	rf.lastHeartBeat = time.Now()
+	reply.Term = rf.currentTerm
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -285,6 +319,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.startElection()
 			}
 			time.Sleep(timeout)
+		}
+	}()
+
+	go func() {
+		for {
+
+			if rf.killed() {
+				return
+			}
+
+			rf.mu.Lock()
+			role := rf.role
+			term := rf.currentTerm
+			rf.mu.Unlock()
+
+			if role == Leader {
+				args := AppendEntriesArgs{
+					Term: term,
+				}
+
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					var reply AppendEntriesReply
+					ok := rf.sendAppendEntries(i, &args, &reply)
+					if !ok {
+						continue
+					}
+					if reply.Term > term {
+						// step down
+						rf.mu.Lock()
+						rf.role = Follower
+						rf.currentTerm = reply.Term
+						rf.mu.Unlock()
+					}
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}()
 

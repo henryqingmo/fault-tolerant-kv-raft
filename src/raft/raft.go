@@ -70,6 +70,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
 	isleader = rf.role == Leader
 	return term, isleader
@@ -92,36 +94,47 @@ type RequestVoteReply struct {
 }
 
 func (rf *Raft) startElection() {
+	rf.mu.Lock()
 	rf.currentTerm += 1
 	args := RequestVoteArgs{
 		rf.currentTerm,
 		rf.me,
 	}
 
+	currentTerm := rf.currentTerm
+	role := rf.role
+	me := rf.me
+	rf.votedFor = rf.me
+	rf.mu.Unlock()
+
 	majority := len(rf.peers)/2 + 1
 
-	if rf.role == Candidate {
+	if role == Candidate {
 		count := 1
-		rf.votedFor = rf.me
 		for i := 0; i < len(rf.peers); i++ {
 			var reply RequestVoteReply
-			if i != rf.me {
+			if i != me {
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if !ok {
 					continue
 				}
-				if reply.Term <= rf.currentTerm &&
-					reply.VoteGranted {
-					count += 1
-				} else {
+				// step down
+				if reply.Term > currentTerm {
+					rf.mu.Lock()
 					rf.currentTerm = reply.Term
 					rf.role = Follower
 					rf.votedFor = -1
+					rf.mu.Unlock()
 					return
+				}
+				if reply.VoteGranted {
+					count += 1
 				}
 			}
 		}
-		if count >= majority {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.role == Candidate && count >= majority {
 			rf.role = Leader
 		}
 	}
@@ -133,22 +146,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Read the fields in "args",
 	// and accordingly assign the values for fields in "reply".
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// reject
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
+	// step down
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = Follower
 		rf.votedFor = -1
 	}
 
+	// grant vote
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.lastHeartBeat = time.Now()
 		return
 	}
 
@@ -255,8 +275,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				return
 			}
 			timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
-			if time.Since(rf.lastHeartBeat) > timeout {
+			rf.mu.Lock()
+			shouldElect := time.Since(rf.lastHeartBeat) > timeout && rf.role != Leader
+			if shouldElect {
 				rf.role = Candidate
+			}
+			rf.mu.Unlock()
+			if shouldElect {
 				rf.startElection()
 			}
 			time.Sleep(timeout)

@@ -53,6 +53,21 @@ type Raft struct {
 	votedFor      int
 	role          Role
 	lastHeartBeat time.Time
+
+	// Volatile state on all servers
+	log         []LogEntry
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	// (Reinitialized after election)
+	nextIndex  []int
+	matchIndex []int
+}
+
+type LogEntry struct {
+	Command interface{}
+	Term    int
 }
 
 type Role int
@@ -265,10 +280,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader := rf.role == Leader
+	if !isLeader {
+		return index, term, isLeader
+	}
+	term = rf.currentTerm
+	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+	index = len(rf.log) - 1
 	return index, term, isLeader
 }
 

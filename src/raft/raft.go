@@ -65,6 +65,8 @@ type Raft struct {
 	// nextIndex keeps tracks of the where the follower is consistent
 	nextIndex  []int
 	matchIndex []int
+
+	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -472,6 +474,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 			}
 			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// apply loop
+	go func() {
+		for {
+			rf.mu.Lock()
+			lastApplied := rf.lastApplied
+			commitIndex := rf.commitIndex
+			log := rf.log
+			rf.mu.Unlock()
+			if lastApplied < commitIndex {
+				var msgs []ApplyMsg
+				for i := lastApplied + 1; i <= commitIndex; i++ {
+					applyMsg := ApplyMsg{
+						true,
+						log[i].Command,
+						i,
+					}
+					msgs = append(msgs, applyMsg)
+				}
+
+				// Dont' hold the lock, too slow
+				for _, msgs := range msgs {
+					applyCh <- msgs
+				}
+
+				rf.mu.Lock()
+				rf.lastApplied = rf.commitIndex
+				rf.mu.Unlock()
+			}
+			time.Sleep(10 * time.Millisecond)
+
 		}
 	}()
 

@@ -100,8 +100,10 @@ func (rf *Raft) GetState() (int, bool) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -129,54 +131,67 @@ type AppendEntriesReply struct {
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm += 1
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term //last
 	args := RequestVoteArgs{
-		rf.currentTerm,
-		rf.me,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
-
 	currentTerm := rf.currentTerm
-	role := rf.role
 	me := rf.me
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
 
 	majority := len(rf.peers)/2 + 1
+	count := 1 // vote for self
 
-	if role == Candidate {
-		count := 1
-		for i := 0; i < len(rf.peers); i++ {
-			if i == me {
-				continue
+	var once sync.Once
+	for i := 0; i < len(rf.peers); i++ {
+		if i == me {
+			continue
+		}
+		go func(peerID int) {
+			var reply RequestVoteReply
+			ok := rf.sendRequestVote(peerID, &args, &reply)
+			if !ok {
+				return
 			}
 
-			go func(peerID int) {
-				var reply RequestVoteReply
-				ok := rf.sendRequestVote(peerID, &args, &reply)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 
-				if !ok {
-					return
-				}
+			// step down if we see a higher term
+			if reply.Term > currentTerm {
+				rf.currentTerm = reply.Term
+				rf.role = Follower
+				rf.votedFor = -1
+				return
+			}
 
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
+			// stale reply
+			if rf.currentTerm != currentTerm || rf.role != Candidate {
+				return
+			}
 
-				// step down
-				if reply.Term > currentTerm {
-					rf.currentTerm = reply.Term
-					rf.role = Follower
-					rf.votedFor = -1
-					return
-				}
-				if reply.VoteGranted {
-					count += 1
-				}
+			if reply.VoteGranted {
+				count++
+			}
 
-				if rf.role == Candidate && count >= majority {
+			if count >= majority {
+				once.Do(func() {
 					rf.role = Leader
-				}
-
-			}(i)
-		}
+					rf.nextIndex = make([]int, len(rf.peers))
+					rf.matchIndex = make([]int, len(rf.peers))
+					for peer := range rf.peers {
+						rf.nextIndex[peer] = len(rf.log)
+						rf.matchIndex[peer] = 0
+					}
+					rf.matchIndex[rf.me] = len(rf.log) - 1
+				})
+			}
+		}(i)
 	}
 }
 
@@ -203,8 +218,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 	}
 
-	// grant vote
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	// grant vote if votedFor is null or candidateId, and candidate's log is at least as up-to-date (§5.4)
+	myLastIndex := len(rf.log) - 1
+	myLastTerm := rf.log[myLastIndex].Term
+	candidateUpToDate := args.LastLogTerm > myLastTerm ||
+		(args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIndex)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && candidateUpToDate {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
@@ -361,6 +381,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.lastHeartBeat = time.Now()
 	rf.role = Follower
+	rf.log = []LogEntry{{nil, 0}} // sentinel at index 0 so lastLogIndex is always >= 0
 
 	// check for timeout
 	go func() {

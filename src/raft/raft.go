@@ -53,6 +53,23 @@ type Raft struct {
 	votedFor      int
 	role          Role
 	lastHeartBeat time.Time
+
+	// Volatile state on all servers
+	log         []LogEntry
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	// (Reinitialized after election)
+
+	// nextIndex keeps tracks of the where the follower is consistent
+	nextIndex  []int
+	matchIndex []int
+}
+
+type LogEntry struct {
+	Command interface{}
+	Term    int
 }
 
 type Role int
@@ -94,12 +111,17 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term int
-	//LeaderID	int
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term int
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) startElection() {
@@ -243,6 +265,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lastHeartBeat = time.Now()
 	reply.Term = rf.currentTerm
+	// 2B
+
+	index := args.PrevLogIndex
+
+	if len(rf.log)-1 < index {
+		reply.Success = false
+		return
+	}
+
+	if rf.log[index].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	log := rf.log[:index+1]
+	log = append(log, args.Entries...)
+	rf.log = log
+	reply.Success = true
+
+	// leader might have commited entries that's has sent here
+	rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -265,10 +308,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader := rf.role == Leader
+	if !isLeader {
+		return index, term, isLeader
+	}
+	term = rf.currentTerm
+	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+	index = len(rf.log) - 1
 	return index, term, isLeader
 }
 
@@ -339,11 +388,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.mu.Lock()
 			role := rf.role
 			term := rf.currentTerm
+			leaderId := rf.me
+
 			rf.mu.Unlock()
 
 			if role == Leader {
 				args := AppendEntriesArgs{
-					Term: term,
+					Term:     term,
+					LeaderID: leaderId,
 				}
 
 				for i := 0; i < len(rf.peers); i++ {

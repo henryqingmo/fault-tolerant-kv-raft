@@ -65,6 +65,8 @@ type Raft struct {
 	// nextIndex keeps tracks of the where the follower is consistent
 	nextIndex  []int
 	matchIndex []int
+
+	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -318,6 +320,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
 	index = len(rf.log) - 1
+	rf.matchIndex[rf.me] = index
 	return index, term, isLeader
 }
 
@@ -359,6 +362,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartBeat = time.Now()
 	rf.role = Follower
 
+	// check for timeout
 	go func() {
 		for {
 			if rf.killed() {
@@ -393,30 +397,116 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.mu.Unlock()
 
 			if role == Leader {
-				args := AppendEntriesArgs{
-					Term:     term,
-					LeaderID: leaderId,
-				}
 
 				for i := 0; i < len(rf.peers); i++ {
-					if i == rf.me {
+					if i == leaderId {
 						continue
 					}
-					var reply AppendEntriesReply
-					ok := rf.sendAppendEntries(i, &args, &reply)
-					if !ok {
-						continue
-					}
-					if reply.Term > term {
-						// step down
+					go func(peerID int) {
+						PrevLogIndex := rf.nextIndex[peerID] - 1
+						PrevLogTerm := rf.log[PrevLogIndex].Term
+
+						args := AppendEntriesArgs{
+							Term:         term,
+							LeaderID:     leaderId,
+							PrevLogIndex: PrevLogIndex,
+							PrevLogTerm:  PrevLogTerm,
+							Entries:      rf.log[PrevLogIndex+1:],
+							LeaderCommit: rf.commitIndex,
+						}
+
+						var reply AppendEntriesReply
+						ok := rf.sendAppendEntries(peerID, &args, &reply)
+
+						if !ok {
+							return
+						}
+
+						if reply.Term > term {
+							// step down
+							rf.mu.Lock()
+							rf.role = Follower
+							rf.currentTerm = reply.Term
+							rf.mu.Unlock()
+						}
+
+						for !reply.Success {
+
+							rf.nextIndex[peerID] -= 1
+							PrevLogIndex := rf.nextIndex[peerID] - 1
+							PrevLogTerm := rf.log[PrevLogIndex].Term
+
+							args := AppendEntriesArgs{
+								Term:         term,
+								LeaderID:     leaderId,
+								PrevLogIndex: PrevLogIndex,
+								PrevLogTerm:  PrevLogTerm,
+								Entries:      rf.log[PrevLogIndex+1:],
+								LeaderCommit: rf.commitIndex,
+							}
+
+							ok := rf.sendAppendEntries(peerID, &args, &reply)
+
+							if !ok {
+								return
+							}
+
+						}
 						rf.mu.Lock()
-						rf.role = Follower
-						rf.currentTerm = reply.Term
-						rf.mu.Unlock()
-					}
+						defer rf.mu.Unlock()
+						rf.nextIndex[peerID] = len(rf.log)
+
+						majority := len(rf.peers)/2 + 1
+
+						for i := rf.commitIndex + 1; i < len(rf.log); i++ {
+							count := 0
+							for peer := 0; peer < len(rf.peers); peer++ {
+								if rf.matchIndex[peer] >= i {
+									count += 1
+								}
+							}
+							if count >= majority {
+								rf.commitIndex = i
+							}
+						}
+
+					}(i)
 				}
 			}
 			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// apply loop
+	go func() {
+		for {
+			rf.mu.Lock()
+			lastApplied := rf.lastApplied
+			commitIndex := rf.commitIndex
+			log := rf.log
+			rf.mu.Unlock()
+			if lastApplied < commitIndex {
+				var msgs []ApplyMsg
+				for i := lastApplied + 1; i <= commitIndex; i++ {
+					applyMsg := ApplyMsg{
+						true,
+						log[i].Command,
+						i,
+					}
+					msgs = append(msgs, applyMsg)
+				}
+
+				// Dont' hold the lock, too slow
+				for _, msgs := range msgs {
+					applyCh <- msgs
+				}
+
+				rf.mu.Lock()
+				rf.lastApplied = rf.commitIndex
+				rf.mu.Unlock()
+			}
+			time.Sleep(10 * time.Millisecond)
+
 		}
 	}()
 

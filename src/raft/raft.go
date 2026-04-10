@@ -147,7 +147,6 @@ func (rf *Raft) startElection() {
 	majority := len(rf.peers)/2 + 1
 	count := 1 // vote for self
 
-	var once sync.Once
 	for i := 0; i < len(rf.peers); i++ {
 		if i == me {
 			continue
@@ -180,16 +179,14 @@ func (rf *Raft) startElection() {
 			}
 
 			if count >= majority {
-				once.Do(func() {
-					rf.role = Leader
-					rf.nextIndex = make([]int, len(rf.peers))
-					rf.matchIndex = make([]int, len(rf.peers))
-					for peer := range rf.peers {
-						rf.nextIndex[peer] = len(rf.log)
-						rf.matchIndex[peer] = 0
-					}
-					rf.matchIndex[rf.me] = len(rf.log) - 1
-				})
+				rf.role = Leader
+				rf.nextIndex = make([]int, len(rf.peers))
+				rf.matchIndex = make([]int, len(rf.peers))
+				for peer := range rf.peers {
+					rf.nextIndex[peer] = len(rf.log)
+					rf.matchIndex[peer] = 0
+				}
+				rf.matchIndex[rf.me] = len(rf.log) - 1
 			}
 		}(i)
 	}
@@ -452,6 +449,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						}
 
 						for !reply.Success {
+							if rf.nextIndex[peerID] <= 1 {
+								break
+							}
 
 							rf.nextIndex[peerID] -= 1
 							PrevLogIndex := rf.nextIndex[peerID] - 1
@@ -476,6 +476,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
 						rf.nextIndex[peerID] = len(rf.log)
+						rf.matchIndex[peerID] = rf.nextIndex[peerID] - 1
 
 						majority := len(rf.peers)/2 + 1
 
@@ -486,7 +487,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									count += 1
 								}
 							}
-							if count >= majority {
+							// Only commit changes in current term
+							if count >= majority && rf.log[i].Term == rf.currentTerm {
 								rf.commitIndex = i
 							}
 						}

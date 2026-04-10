@@ -130,6 +130,10 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
+	if rf.role != Candidate {
+		rf.mu.Unlock()
+		return
+	}
 	rf.currentTerm += 1
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term //last
@@ -280,6 +284,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.role = Follower
 		rf.currentTerm = args.Term
+		rf.votedFor = -1
 	}
 
 	rf.lastHeartBeat = time.Now()
@@ -303,8 +308,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = log
 	reply.Success = true
 
-	// leader might have commited entries that's has sent here
-	rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	// leader might have commited entries that's havn't been sent here
+	rf.commitIndex = max(min(args.LeaderCommit, len(rf.log)-1), rf.commitIndex)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -421,16 +426,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						continue
 					}
 					go func(peerID int) {
+						rf.mu.Lock()
 						PrevLogIndex := rf.nextIndex[peerID] - 1
 						PrevLogTerm := rf.log[PrevLogIndex].Term
+						entries := rf.log[PrevLogIndex+1:]
+						commitIndex := rf.commitIndex
+						rf.mu.Unlock()
 
 						args := AppendEntriesArgs{
 							Term:         term,
 							LeaderID:     leaderId,
 							PrevLogIndex: PrevLogIndex,
 							PrevLogTerm:  PrevLogTerm,
-							Entries:      rf.log[PrevLogIndex+1:],
-							LeaderCommit: rf.commitIndex,
+							Entries:      entries,
+							LeaderCommit: commitIndex,
 						}
 
 						var reply AppendEntriesReply
@@ -440,43 +449,49 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							return
 						}
 
+						// step down
 						if reply.Term > term {
-							// step down
 							rf.mu.Lock()
 							rf.role = Follower
 							rf.currentTerm = reply.Term
+							rf.votedFor = -1
 							rf.mu.Unlock()
+							return
 						}
 
 						for !reply.Success {
+							rf.mu.Lock()
 							if rf.nextIndex[peerID] <= 1 {
-								break
+								rf.mu.Unlock()
+								return
 							}
-
 							rf.nextIndex[peerID] -= 1
-							PrevLogIndex := rf.nextIndex[peerID] - 1
-							PrevLogTerm := rf.log[PrevLogIndex].Term
-
-							args := AppendEntriesArgs{
+							PrevLogIndex = rf.nextIndex[peerID] - 1
+							PrevLogTerm = rf.log[PrevLogIndex].Term
+							entries = rf.log[PrevLogIndex+1:]
+							args = AppendEntriesArgs{
 								Term:         term,
 								LeaderID:     leaderId,
 								PrevLogIndex: PrevLogIndex,
 								PrevLogTerm:  PrevLogTerm,
-								Entries:      rf.log[PrevLogIndex+1:],
+								Entries:      entries,
 								LeaderCommit: rf.commitIndex,
 							}
-
-							ok := rf.sendAppendEntries(peerID, &args, &reply)
-
+							rf.mu.Unlock()
+							reply = AppendEntriesReply{}
+							ok = rf.sendAppendEntries(peerID, &args, &reply)
 							if !ok {
 								return
 							}
-
 						}
+
+						// set matchIndex to what the follower actually confirmed,
+						confirmedIndex := PrevLogIndex + len(entries)
+
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
-						rf.nextIndex[peerID] = len(rf.log)
-						rf.matchIndex[peerID] = rf.nextIndex[peerID] - 1
+						rf.nextIndex[peerID] = confirmedIndex + 1
+						rf.matchIndex[peerID] = confirmedIndex
 
 						majority := len(rf.peers)/2 + 1
 
@@ -525,7 +540,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 
 				rf.mu.Lock()
-				rf.lastApplied = rf.commitIndex
+				rf.lastApplied = commitIndex
 				rf.mu.Unlock()
 			}
 			time.Sleep(10 * time.Millisecond)

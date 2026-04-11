@@ -65,8 +65,6 @@ type Raft struct {
 	// nextIndex keeps tracks of the where the follower is consistent
 	nextIndex  []int
 	matchIndex []int
-
-	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -182,7 +180,7 @@ func (rf *Raft) startElection() {
 				count++
 			}
 
-			if count >= majority {
+			if count >= majority && rf.role != Leader {
 				rf.role = Leader
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
@@ -280,12 +278,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// step down
+	// §5.2: if leader’s term >= ours, recognize it as legitimate and become Follower.
+	// Only reset votedFor when the term actually advances (not on equal-term messages,
+	// so we don’t forget a vote we already cast this term).
 	if args.Term > rf.currentTerm {
-		rf.role = Follower
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
+	rf.role = Follower
 
 	rf.lastHeartBeat = time.Now()
 	reply.Term = rf.currentTerm
@@ -303,9 +303,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	log := rf.log[:index+1]
-	log = append(log, args.Entries...)
-	rf.log = log
+	rf.log = append(rf.log[:index+1:index+1], args.Entries...)
 	reply.Success = true
 
 	// leader might have commited entries that's havn't been sent here
@@ -392,6 +390,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				return
 			}
 			timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
+			time.Sleep(timeout)
+			// Check AFTER sleeping so we measure against the same timeout we slept for,
+			// avoiding spurious elections when a heartbeat arrived mid-sleep.
 			rf.mu.Lock()
 			shouldElect := time.Since(rf.lastHeartBeat) > timeout && rf.role != Leader
 			if shouldElect {
@@ -401,7 +402,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			if shouldElect {
 				rf.startElection()
 			}
-			time.Sleep(timeout)
 		}
 	}()
 
@@ -449,7 +449,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							return
 						}
 
-						// step down
+						// step down if follower has a higher term
 						if reply.Term > term {
 							rf.mu.Lock()
 							rf.role = Follower
@@ -461,6 +461,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						for !reply.Success {
 							rf.mu.Lock()
+							// Stop retrying if no longer leader or term changed
+							if rf.role != Leader || rf.currentTerm != term {
+								rf.mu.Unlock()
+								return
+							}
 							if rf.nextIndex[peerID] <= 1 {
 								rf.mu.Unlock()
 								return
@@ -483,6 +488,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							if !ok {
 								return
 							}
+							// Check for higher term in retry replies too
+							if reply.Term > term {
+								rf.mu.Lock()
+								rf.role = Follower
+								rf.currentTerm = reply.Term
+								rf.votedFor = -1
+								rf.mu.Unlock()
+								return
+							}
 						}
 
 						// set matchIndex to what the follower actually confirmed,
@@ -490,8 +504,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
-						rf.nextIndex[peerID] = confirmedIndex + 1
-						rf.matchIndex[peerID] = confirmedIndex
+						// Discard replies from stale terms — matchIndex/nextIndex were
+						// reinitialized on re-election, so a stale confirmedIndex could push
+						// nextIndex beyond the current log and cause a panic.
+						if rf.role != Leader || rf.currentTerm != term {
+							return
+						}
+						// Only advance — never go backwards
+						if confirmedIndex > rf.matchIndex[peerID] {
+							rf.matchIndex[peerID] = confirmedIndex
+							rf.nextIndex[peerID] = confirmedIndex + 1
+						}
 
 						majority := len(rf.peers)/2 + 1
 

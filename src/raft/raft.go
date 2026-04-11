@@ -126,6 +126,17 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func (rf *Raft) becomeLeaderLocked() {
+	rf.role = Leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for peer := range rf.peers {
+		rf.nextIndex[peer] = len(rf.log)
+		rf.matchIndex[peer] = 0
+	}
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+}
+
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	if rf.role != Candidate {
@@ -144,9 +155,15 @@ func (rf *Raft) startElection() {
 	currentTerm := rf.currentTerm
 	me := rf.me
 	rf.votedFor = rf.me
+	rf.lastHeartBeat = time.Now()
+	majority := len(rf.peers)/2 + 1
+	if majority == 1 {
+		rf.becomeLeaderLocked()
+		rf.mu.Unlock()
+		return
+	}
 	rf.mu.Unlock()
 
-	majority := len(rf.peers)/2 + 1
 	count := 1 // vote for self
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -181,14 +198,7 @@ func (rf *Raft) startElection() {
 			}
 
 			if count >= majority && rf.role != Leader {
-				rf.role = Leader
-				rf.nextIndex = make([]int, len(rf.peers))
-				rf.matchIndex = make([]int, len(rf.peers))
-				for peer := range rf.peers {
-					rf.nextIndex[peer] = len(rf.log)
-					rf.matchIndex[peer] = 0
-				}
-				rf.matchIndex[rf.me] = len(rf.log) - 1
+				rf.becomeLeaderLocked()
 			}
 		}(i)
 	}
@@ -303,7 +313,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.log = append(rf.log[:index+1:index+1], args.Entries...)
+	// fix over truncation of uncommited entries
+	// handles the heartbeat case with empty args entry
+
+	for i, entry := range args.Entries {
+		logIndex := index + 1 + i
+		if logIndex < len(rf.log) {
+			if rf.log[logIndex].Term != entry.Term {
+				rf.log = append(rf.log[:logIndex:logIndex], args.Entries[i:]...)
+				break
+			}
+			continue
+		}
+		rf.log = append(rf.log, args.Entries[i:]...)
+		break
+	}
 	reply.Success = true
 
 	// leader might have commited entries that's havn't been sent here
@@ -333,14 +357,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	term = rf.currentTerm
 	isLeader := rf.role == Leader
 	if !isLeader {
 		return index, term, isLeader
 	}
-	term = rf.currentTerm
 	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
 	index = len(rf.log) - 1
 	rf.matchIndex[rf.me] = index
+	if len(rf.peers) == 1 {
+		rf.commitIndex = index
+	}
 	return index, term, isLeader
 }
 
@@ -541,6 +568,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// apply loop
 	go func() {
 		for {
+			if rf.killed() {
+				return
+			}
 			rf.mu.Lock()
 			lastApplied := rf.lastApplied
 			commitIndex := rf.commitIndex
